@@ -153,10 +153,10 @@ class GPT(nn.Module):
         self.cos, self.sin = cos, sin
         # Cast embeddings to bf16
         self.transformer.wte.to(dtype=torch.bfloat16)
-        # Zero-init pseudo_queries (ensures uniform initial attention weights)
+        # Normal-init pseudo_queries (breaks symmetry)
         for block in self.transformer.h:
-            torch.nn.init.zeros_(block.attn_ar.pseudo_query)
-            torch.nn.init.zeros_(block.mlp_ar.pseudo_query)
+            torch.nn.init.normal_(block.attn_ar.pseudo_query, mean=0.0, std=0.01)
+            torch.nn.init.normal_(block.mlp_ar.pseudo_query, mean=0.0, std=0.01)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
