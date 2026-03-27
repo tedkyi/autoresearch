@@ -44,9 +44,56 @@ def norm(x):
     return F.rms_norm(x, (x.size(-1),))
 
 
-def has_ve(layer_idx, n_layer):
-    """Returns True if layer should have Value Embedding (alternating, last always included)."""
-    return layer_idx % 2 == (n_layer - 1) % 2
+class RMSNormNoWeight(nn.Module):
+    """RMSNorm without a learnable scale parameter.
+    
+    Used in AttnRes kernel function to normalize keys so that layers with
+    large-magnitude outputs do not dominate the softmax.
+    """
+    def __init__(self, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.eps = eps
+
+    def forward(self, x):
+        """Apply RMS normalization without learned scale."""
+        rms = torch.rsqrt(x.float().pow(2).mean(-1, keepdim=True) + self.eps)
+        return (x.float() * rms).to(x.dtype)
+
+
+class AttnResOperator(nn.Module):
+    """Depth-wise Attention Residual operator.
+    
+    Computes softmax attention over source representations using a learned
+    pseudo-query vector. The pseudo-query is initialized to zero so that
+    initial attention weights are uniform, preventing training volatility.
+    """
+    def __init__(self, d_model: int, eps: float = 1e-6) -> None:
+        super().__init__()
+        self.pseudo_query = nn.Parameter(torch.zeros(d_model))
+        self.key_norm = RMSNormNoWeight(eps=eps)
+
+    def forward(self, sources):
+        """Compute weighted aggregation of source representations.
+        
+        Args:
+            sources: Tensor of shape (N_src, B, T, d) containing the
+                source representations to attend over.
+                
+        Returns:
+            Aggregated representation of shape (B, T, d).
+        """
+        # K = RMSNorm(sources), no learned weight
+        K = self.key_norm(sources)  # [N_src, B, T, d]
+        
+        # Compute logits: dot product of pseudo-query with each normalized source
+        logits = torch.einsum("d, n b t d -> n b t", self.pseudo_query, K)
+        
+        # Softmax over sources (depth dimension)
+        weights = F.softmax(logits, dim=0)  # [N_src, B, T]
+        
+        # Weighted sum
+        out = torch.einsum("n b t, n b t d -> b t d", weights, sources)
+        return out
 
 
 def apply_rotary_emb(x, cos, sin):
@@ -59,7 +106,7 @@ def apply_rotary_emb(x, cos, sin):
 
 
 class CausalSelfAttention(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config):
         super().__init__()
         self.n_head = config.n_head
         self.n_kv_head = config.n_kv_head
@@ -71,20 +118,12 @@ class CausalSelfAttention(nn.Module):
         self.c_k = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_v = nn.Linear(self.n_embd, self.n_kv_head * self.head_dim, bias=False)
         self.c_proj = nn.Linear(self.n_embd, self.n_embd, bias=False)
-        self.ve_gate_channels = 32
-        self.ve_gate = nn.Linear(self.ve_gate_channels, self.n_kv_head, bias=False) if has_ve(layer_idx, config.n_layer) else None
 
-    def forward(self, x, ve, cos_sin, window_size):
+    def forward(self, x, cos_sin, window_size):
         B, T, C = x.size()
         q = self.c_q(x).view(B, T, self.n_head, self.head_dim)
         k = self.c_k(x).view(B, T, self.n_kv_head, self.head_dim)
         v = self.c_v(x).view(B, T, self.n_kv_head, self.head_dim)
-
-        # Value residual (ResFormer): mix in value embedding with input-dependent gate per head
-        if ve is not None:
-            ve = ve.view(B, T, self.n_kv_head, self.head_dim)
-            gate = 2 * torch.sigmoid(self.ve_gate(x[..., :self.ve_gate_channels]))
-            v = v + gate.unsqueeze(-1) * ve
 
         cos, sin = cos_sin
         q, k = apply_rotary_emb(q, cos, sin), apply_rotary_emb(k, cos, sin)
@@ -110,13 +149,21 @@ class MLP(nn.Module):
 
 
 class Block(nn.Module):
-    def __init__(self, config, layer_idx):
+    def __init__(self, config):
         super().__init__()
-        self.attn = CausalSelfAttention(config, layer_idx)
+        self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
 
-    def forward(self, x, ve, cos_sin, window_size):
-        x = x + self.attn(norm(x), ve, cos_sin, window_size)
+    def forward(self, x, cos_sin, window_size):
+        """Forward pass with depth-wise attention residuals.
+        
+        Args:
+            x: Routed input (combines previous layer outputs via AttnResOperator)
+            cos_sin: Rotary embeddings
+            window_size: Attention window configuration
+        """
+        # Apply attention and MLP with residual connections
+        x = x + self.attn(norm(x), cos_sin, window_size)
         x = x + self.mlp(norm(x))
         return x
 
@@ -128,19 +175,14 @@ class GPT(nn.Module):
         self.window_sizes = self._compute_window_sizes(config)
         self.transformer = nn.ModuleDict({
             "wte": nn.Embedding(config.vocab_size, config.n_embd),
-            "h": nn.ModuleList([Block(config, i) for i in range(config.n_layer)]),
+            "h": nn.ModuleList([Block(config) for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        self.resid_lambdas = nn.Parameter(torch.ones(config.n_layer))
-        self.x0_lambdas = nn.Parameter(torch.zeros(config.n_layer))
-        # Value embeddings
-        head_dim = config.n_embd // config.n_head
-        kv_dim = config.n_kv_head * head_dim
-        self.value_embeds = nn.ModuleDict({
-            str(i): nn.Embedding(config.vocab_size, kv_dim)
-            for i in range(config.n_layer) if has_ve(i, config.n_layer)
-        })
+        # Depth-wise Attention Residuals operators: one per sub-layer
+        self.attn_res_ops = nn.ModuleList([AttnResOperator(config.n_embd) for _ in range(config.n_layer)])
+        self.mlp_res_ops = nn.ModuleList([AttnResOperator(config.n_embd) for _ in range(config.n_layer)])
         # Rotary embeddings
+        head_dim = config.n_embd // config.n_head
         self.rotary_seq_len = config.sequence_len * 10
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.register_buffer("cos", cos, persistent=False)
@@ -161,24 +203,13 @@ class GPT(nn.Module):
             torch.nn.init.zeros_(block.attn.c_proj.weight)
             torch.nn.init.uniform_(block.mlp.c_fc.weight, -s, s)
             torch.nn.init.zeros_(block.mlp.c_proj.weight)
-        # Per-layer scalars
-        self.resid_lambdas.fill_(1.0)
-        self.x0_lambdas.fill_(0.1)
-        # Value embeddings
-        for ve in self.value_embeds.values():
-            torch.nn.init.uniform_(ve.weight, -s, s)
-        # Gate weights init to zero (sigmoid(0)=0.5, scaled by 2 -> 1.0 = neutral)
-        for block in self.transformer.h:
-            if block.attn.ve_gate is not None:
-                torch.nn.init.zeros_(block.attn.ve_gate.weight)
+        # Attention Residual operators (pseudo-queries already zero-initialized)
         # Rotary embeddings
         head_dim = self.config.n_embd // self.config.n_head
         cos, sin = self._precompute_rotary_embeddings(self.rotary_seq_len, head_dim)
         self.cos, self.sin = cos, sin
         # Cast embeddings to bf16
         self.transformer.wte.to(dtype=torch.bfloat16)
-        for ve in self.value_embeds.values():
-            ve.to(dtype=torch.bfloat16)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
@@ -208,9 +239,8 @@ class GPT(nn.Module):
     def estimate_flops(self):
         """Estimated FLOPs per token (forward + backward)."""
         nparams = sum(p.numel() for p in self.parameters())
-        value_embeds_numel = sum(ve.weight.numel() for ve in self.value_embeds.values())
-        nparams_exclude = (self.transformer.wte.weight.numel() + value_embeds_numel +
-                          self.resid_lambdas.numel() + self.x0_lambdas.numel())
+        # Exclude embeddings and shallow parameters
+        nparams_exclude = self.transformer.wte.weight.numel()
         h = self.config.n_head
         q = self.config.n_embd // self.config.n_head
         t = self.config.sequence_len
@@ -223,36 +253,39 @@ class GPT(nn.Module):
 
     def num_scaling_params(self):
         wte = sum(p.numel() for p in self.transformer.wte.parameters())
-        value_embeds = sum(p.numel() for p in self.value_embeds.parameters())
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
-        scalars = self.resid_lambdas.numel() + self.x0_lambdas.numel()
-        total = wte + value_embeds + lm_head + transformer_matrices + scalars
+        attn_res_ops = sum(p.numel() for p in self.attn_res_ops.parameters())
+        mlp_res_ops = sum(p.numel() for p in self.mlp_res_ops.parameters())
+        total = wte + lm_head + transformer_matrices + attn_res_ops + mlp_res_ops
         return {
-            'wte': wte, 'value_embeds': value_embeds, 'lm_head': lm_head,
-            'transformer_matrices': transformer_matrices, 'scalars': scalars, 'total': total,
+            'wte': wte, 'lm_head': lm_head,
+            'transformer_matrices': transformer_matrices,
+            'attn_res_ops': attn_res_ops, 'mlp_res_ops': mlp_res_ops,
+            'total': total,
         }
 
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95), scalar_lr=0.5):
         model_dim = self.config.n_embd
         matrix_params = list(self.transformer.h.parameters())
-        value_embeds_params = list(self.value_embeds.parameters())
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
-        resid_params = [self.resid_lambdas]
-        x0_params = [self.x0_lambdas]
+        attn_res_params = list(self.attn_res_ops.parameters())
+        mlp_res_params = list(self.mlp_res_ops.parameters())
+        
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(value_embeds_params) + len(resid_params) + len(x0_params))
+            len(lm_head_params) + len(attn_res_params) + len(mlp_res_params)), \
+            f"Expected {len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(attn_res_params) + len(mlp_res_params)}, got {len(list(self.parameters()))}"
+        
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
         param_groups = [
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=value_embeds_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=resid_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=x0_params, lr=scalar_lr, betas=(0.96, 0.95), eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=attn_res_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=mlp_res_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -272,11 +305,25 @@ class GPT(nn.Module):
 
         x = self.transformer.wte(idx)
         x = norm(x)
-        x0 = x
+        
+        # Accumulate sources for depth-wise routing
+        attn_sources = [x]  # Start with embedding
+        mlp_sources = [x]
+        
         for i, block in enumerate(self.transformer.h):
-            x = self.resid_lambdas[i] * x + self.x0_lambdas[i] * x0
-            ve = self.value_embeds[str(i)](idx) if str(i) in self.value_embeds else None
-            x = block(x, ve, cos_sin, self.window_sizes[i])
+            # Route previous outputs via depth-wise attention residuals
+            attn_sources_stacked = torch.stack(attn_sources)  # [N_src, B, T, d]
+            mlp_sources_stacked = torch.stack(mlp_sources)
+            
+            x_routed = self.attn_res_ops[i](attn_sources_stacked)  # [B, T, d]
+            
+            # Apply block (attention and MLP)
+            x = block(x_routed, cos_sin, self.window_sizes[i])
+            
+            # Accumulate for next layer
+            attn_sources.append(x)
+            mlp_sources.append(x)
+        
         x = norm(x)
 
         softcap = 15
