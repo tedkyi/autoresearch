@@ -69,7 +69,7 @@ class AttnResOperator(nn.Module):
     """
     def __init__(self, d_model: int, eps: float = 1e-6) -> None:
         super().__init__()
-        self.pseudo_query = nn.Parameter(torch.zeros(d_model))
+        self.pseudo_query = nn.Parameter(torch.randn(d_model) * 0.02)
         self.key_norm = RMSNormNoWeight(eps=eps)
 
     def forward(self, sources):
@@ -153,19 +153,31 @@ class Block(nn.Module):
         super().__init__()
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
+        # Add AttnRes between attention and FFN (following reference implementation)
+        self.attn_res = AttnResOperator(config.n_embd)
 
     def forward(self, x, cos_sin, window_size):
-        """Forward pass with depth-wise attention residuals.
+        """Forward pass with attention residuals between sub-layers.
         
         Args:
-            x: Routed input (combines previous layer outputs via AttnResOperator)
+            x: Input to the block
             cos_sin: Rotary embeddings
             window_size: Attention window configuration
+            
+        Returns:
+            Block output with internal AttnRes routing
         """
-        # Apply attention and MLP with residual connections
-        x = x + self.attn(norm(x), cos_sin, window_size)
-        x = x + self.mlp(norm(x))
-        return x
+        # Attention sub-layer
+        attn_out = self.attn(norm(x), cos_sin, window_size)
+        
+        # Route attention output with previous sources (including input x)
+        sources = torch.stack([x, attn_out])  # [2, B, T, d]
+        routed = self.attn_res(sources)  # [B, T, d]
+        
+        # FFN sub-layer
+        ffn_out = self.mlp(norm(routed))
+        
+        return ffn_out
 
 
 class GPT(nn.Module):
@@ -178,9 +190,6 @@ class GPT(nn.Module):
             "h": nn.ModuleList([Block(config) for i in range(config.n_layer)]),
         })
         self.lm_head = nn.Linear(config.n_embd, config.vocab_size, bias=False)
-        # Depth-wise Attention Residuals operators: one per sub-layer
-        self.attn_res_ops = nn.ModuleList([AttnResOperator(config.n_embd) for _ in range(config.n_layer)])
-        self.mlp_res_ops = nn.ModuleList([AttnResOperator(config.n_embd) for _ in range(config.n_layer)])
         # Rotary embeddings
         head_dim = config.n_embd // config.n_head
         self.rotary_seq_len = config.sequence_len * 10
@@ -256,12 +265,11 @@ class GPT(nn.Module):
         lm_head = sum(p.numel() for p in self.lm_head.parameters())
         transformer_matrices = sum(p.numel() for p in self.transformer.h.parameters())
         attn_res_ops = sum(p.numel() for p in self.attn_res_ops.parameters())
-        mlp_res_ops = sum(p.numel() for p in self.mlp_res_ops.parameters())
-        total = wte + lm_head + transformer_matrices + attn_res_ops + mlp_res_ops
+        total = wte + lm_head + transformer_matrices + attn_res_ops
         return {
             'wte': wte, 'lm_head': lm_head,
             'transformer_matrices': transformer_matrices,
-            'attn_res_ops': attn_res_ops, 'mlp_res_ops': mlp_res_ops,
+            'attn_res_ops': attn_res_ops,
             'total': total,
         }
 
@@ -272,11 +280,10 @@ class GPT(nn.Module):
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         attn_res_params = list(self.attn_res_ops.parameters())
-        mlp_res_params = list(self.mlp_res_ops.parameters())
         
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params) + len(attn_res_params) + len(mlp_res_params)), \
-            f"Expected {len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(attn_res_params) + len(mlp_res_params)}, got {len(list(self.parameters()))}"
+            len(lm_head_params) + len(attn_res_params)), \
+            f"Expected {len(matrix_params) + len(embedding_params) + len(lm_head_params) + len(attn_res_params)}, got {len(list(self.parameters()))}"
         
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
@@ -285,7 +292,6 @@ class GPT(nn.Module):
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=attn_res_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
-            dict(kind='adamw', params=mlp_res_params, lr=scalar_lr * 0.01, betas=adam_betas, eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -306,23 +312,8 @@ class GPT(nn.Module):
         x = self.transformer.wte(idx)
         x = norm(x)
         
-        # Accumulate sources for depth-wise routing
-        attn_sources = [x]  # Start with embedding
-        mlp_sources = [x]
-        
-        for i, block in enumerate(self.transformer.h):
-            # Route previous outputs via depth-wise attention residuals
-            attn_sources_stacked = torch.stack(attn_sources)  # [N_src, B, T, d]
-            mlp_sources_stacked = torch.stack(mlp_sources)
-            
-            x_routed = self.attn_res_ops[i](attn_sources_stacked)  # [B, T, d]
-            
-            # Apply block (attention and MLP)
-            x = block(x_routed, cos_sin, self.window_sizes[i])
-            
-            # Accumulate for next layer
-            attn_sources.append(x)
-            mlp_sources.append(x)
+        for block in self.transformer.h:
+            x = block(x, cos_sin, self.window_sizes[len(self.transformer.h) - 1])
         
         x = norm(x)
 
