@@ -85,16 +85,37 @@ class MLP(nn.Module):
         return x
 
 
+class AttnResOperator(nn.Module):
+    def __init__(self, n_embd):
+        super().__init__()
+        self.pseudo_query = nn.Parameter(torch.zeros(n_embd))
+
+    def forward(self, sources):
+        # sources: [N_src, B, T, d]
+        K = F.rms_norm(sources, (sources.size(-1),))
+        logits = torch.einsum("d,nbtd->nbt", self.pseudo_query, K)
+        weights = F.softmax(logits, dim=0)
+        return torch.einsum("nbt,nbtd->btd", weights, sources)
+
+
 class Block(nn.Module):
     def __init__(self, config):
         super().__init__()
         self.attn = CausalSelfAttention(config)
         self.mlp = MLP(config)
+        self.attn_ar = AttnResOperator(config.n_embd)
+        self.mlp_ar = AttnResOperator(config.n_embd)
 
-    def forward(self, x, cos_sin):
-        x = x + self.attn(norm(x), cos_sin)
-        x = x + self.mlp(norm(x))
-        return x
+    def forward(self, layer_outputs, cos_sin):
+        sources = torch.stack(layer_outputs, dim=0)
+        h_attn = self.attn_ar(sources)
+        attn_out = self.attn(norm(h_attn), cos_sin)
+
+        sources2 = torch.stack(layer_outputs + [attn_out], dim=0)
+        h_mlp = self.mlp_ar(sources2)
+        mlp_out = self.mlp(norm(h_mlp))
+
+        return attn_out, mlp_out
 
 
 class GPT(nn.Module):
@@ -132,6 +153,10 @@ class GPT(nn.Module):
         self.cos, self.sin = cos, sin
         # Cast embeddings to bf16
         self.transformer.wte.to(dtype=torch.bfloat16)
+        # Zero-init pseudo_queries (ensures uniform initial attention weights)
+        for block in self.transformer.h:
+            torch.nn.init.zeros_(block.attn_ar.pseudo_query)
+            torch.nn.init.zeros_(block.mlp_ar.pseudo_query)
 
     def _precompute_rotary_embeddings(self, seq_len, head_dim, base=10000, device=None):
         if device is None:
@@ -169,17 +194,22 @@ class GPT(nn.Module):
     def setup_optimizer(self, unembedding_lr=0.004, embedding_lr=0.2, matrix_lr=0.02,
                         weight_decay=0.0, adam_betas=(0.8, 0.95)):
         model_dim = self.config.n_embd
-        matrix_params = list(self.transformer.h.parameters())
+        pseudo_query_params = [p for block in self.transformer.h
+                               for p in [block.attn_ar.pseudo_query, block.mlp_ar.pseudo_query]]
+        pseudo_query_ids = {id(p) for p in pseudo_query_params}
+        matrix_params = [p for p in self.transformer.h.parameters()
+                         if id(p) not in pseudo_query_ids]
         embedding_params = list(self.transformer.wte.parameters())
         lm_head_params = list(self.lm_head.parameters())
         assert len(list(self.parameters())) == (len(matrix_params) + len(embedding_params) +
-            len(lm_head_params))
+            len(lm_head_params) + len(pseudo_query_params))
         # Scale LR ∝ 1/√dmodel (tuned at 768 dim)
         dmodel_lr_scale = (model_dim / 768) ** -0.5
         print(f"Scaling AdamW LRs by 1/sqrt({model_dim}/768) = {dmodel_lr_scale:.6f}")
         param_groups = [
             dict(kind='adamw', params=lm_head_params, lr=unembedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
             dict(kind='adamw', params=embedding_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
+            dict(kind='adamw', params=pseudo_query_params, lr=embedding_lr * dmodel_lr_scale, betas=adam_betas, eps=1e-10, weight_decay=0.0),
         ]
         for shape in sorted({p.shape for p in matrix_params}):
             group_params = [p for p in matrix_params if p.shape == shape]
@@ -199,8 +229,12 @@ class GPT(nn.Module):
 
         x = self.transformer.wte(idx)
         x = norm(x)
+        layer_outputs = [x]
         for block in self.transformer.h:
-            x = block(x, cos_sin)
+            attn_out, mlp_out = block(layer_outputs, cos_sin)
+            layer_outputs.append(attn_out)
+            layer_outputs.append(mlp_out)
+        x = torch.stack(layer_outputs, dim=0).sum(dim=0)
         x = norm(x)
 
         logits = self.lm_head(x).float()
